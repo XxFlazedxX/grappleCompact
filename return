@@ -1,0 +1,218 @@
+local Players     = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local Workspace   = game:GetService("Workspace")
+
+-- ===== GUI (compact) =====
+local gui = Instance.new("ScreenGui")
+gui.Name = "FLZ_Aimbot_ShootOnce"
+gui.ResetOnSpawn = false
+gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame", gui)
+frame.Size = UDim2.new(0, 220, 0, 130)
+frame.Position = UDim2.new(0.5, -110, 0.5, -65)
+frame.BackgroundTransparency = 0.28
+frame.BackgroundColor3 = Color3.fromRGB(20,20,20)
+frame.Active = true
+frame.Draggable = true
+frame.Visible = false
+
+local openButton = Instance.new("TextButton", gui)
+openButton.Size = UDim2.new(0, 120, 0, 28)
+openButton.Position = UDim2.new(0, 18, 0.5, -14)
+openButton.Text = "5_TextBox Open Aimbot"
+openButton.TextColor3 = Color3.new(1,1,1)
+openButton.BackgroundColor3 = Color3.fromRGB(40,40,40)
+openButton.Font = Enum.Font.GothamBold
+openButton.TextSize = 14
+openButton.Draggable = true
+
+openButton.MouseButton1Click:Connect(function()
+    frame.Visible = not frame.Visible
+    openButton.Text = frame.Visible and "Close Aimbot" or "Open Aimbot"
+end)
+
+local title = Instance.new("TextLabel", frame)
+title.Size = UDim2.new(1, -16, 0, 18)
+title.Position = UDim2.new(0,8,0,6)
+title.Text = "Flazeds Aimbot ShootOnce"
+title.TextColor3 = Color3.new(1,1,1)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+
+local nameBox = Instance.new("TextBox", frame)
+nameBox.Size = UDim2.new(0, 200, 0, 24)
+nameBox.Position = UDim2.new(0,10,0,30)
+nameBox.PlaceholderText = "Enter player name"
+nameBox.TextColor3 = Color3.new(1,1,1)
+nameBox.BackgroundColor3 = Color3.fromRGB(36,36,36)
+nameBox.ClearTextOnFocus = true
+nameBox.Font = Enum.Font.Gotham
+nameBox.TextSize = 14
+
+local shootBtn = Instance.new("TextButton", frame)
+shootBtn.Size = UDim2.new(0, 200, 0, 28)
+shootBtn.Position = UDim2.new(0,10,0,60)
+shootBtn.Text = "Shoot Aimbot once"
+shootBtn.TextColor3 = Color3.new(1,1,1)
+shootBtn.BackgroundColor3 = Color3.fromRGB(54,54,54)
+shootBtn.Font = Enum.Font.GothamBold
+shootBtn.TextSize = 14
+
+local statusLabel = Instance.new("TextLabel", frame)
+statusLabel.Size = UDim2.new(0, 200, 0, 22)
+statusLabel.Position = UDim2.new(0,10,0,94)
+statusLabel.Text = "Status: Idle"
+statusLabel.TextColor3 = Color3.new(1,1,1)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 13
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+-- ===== AIM / PREDICTION CONFIG (tweakable) =====
+local BASE_LEAD        = 8       -- base studs in front (bigger -> more in front)
+local SPEED_LEAD_MULT  = 0.18    -- extra lead per studs/sec of target horizontal speed
+local DIST_LEAD_MULT   = 0.02    -- extra lead per stud of distance (helps long shots)
+local MAX_LEAD         = 28      -- clamp so it doesn't go crazy far in front
+local MIN_SPEED        = 4       -- below this, treat as standing (no horizontal lead)
+
+local GRAPPLE_SPEED    = 140     -- estimated horizontal grapple travel speed (studs/sec). Tweak to match your grapple.
+local MAX_Y_ABOVE      = 6       -- clamp vertical prediction above target
+local MAX_Y_BELOW      = 4       -- clamp vertical prediction below target
+local MIN_RELATIVE_Y   = -2      -- don't aim more than this under target Y (safety)
+
+-- ===== HELPERS =====
+local function hrpOf(plr)
+    local c = plr and plr.Character
+    return c and (c:FindFirstChild("HumanoidRootPart") or c:FindFirstChild("Torso"))
+end
+
+local function hasGrappleTool()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    for _, tool in ipairs(char:GetChildren()) do
+        if tool:IsA("Tool") and tool:FindFirstChild("RemoteEvent") then
+            return tool
+        end
+    end
+end
+
+local function acquireTarget(partial)
+    local q = (partial or ""):lower()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            local n = tostring(p.Name):lower()
+            local d = tostring(p.DisplayName):lower()
+            if n:find(q, 1, true) or d:find(q, 1, true) then
+                return p
+            end
+        end
+    end
+end
+
+-- horizontal lead: small, distance + speed scaled, clamped
+local function computeHorizontalAim(targetHRP, lpHRP)
+    local vel = targetHRP.AssemblyLinearVelocity
+    local horiz = Vector3.new(vel.X, 0, vel.Z)
+    local speed = horiz.Magnitude
+
+    -- standing: aim directly
+    if speed < MIN_SPEED then
+        return targetHRP.Position
+    end
+
+    local dist = 0
+    if lpHRP then
+        dist = (targetHRP.Position - lpHRP.Position).Magnitude
+    end
+
+    local lead = BASE_LEAD + (speed * SPEED_LEAD_MULT) + (dist * DIST_LEAD_MULT)
+    lead = math.clamp(lead, 0, MAX_LEAD)
+
+    local dir = horiz.Magnitude > 0.1 and horiz.Unit or Vector3.new(targetHRP.CFrame.LookVector.X, 0, targetHRP.CFrame.LookVector.Z)
+    local aimed = targetHRP.Position + dir * lead
+    -- keep same Y for horizontal aim; vertical handled separately
+    return Vector3.new(aimed.X, targetHRP.Position.Y, aimed.Z)
+end
+
+-- vertical prediction using projectile kinematics (only if vertical motion present)
+local function predictVerticalY(targetHRP, horizAim)
+    local vy = targetHRP.AssemblyLinearVelocity.Y
+    if math.abs(vy) < 0.8 then
+        return targetHRP.Position.Y, 0
+    end
+
+    local lpHRP = hrpOf(LocalPlayer)
+    if not lpHRP then
+        return targetHRP.Position.Y, 0
+    end
+
+    local horizDist = Vector3.new(horizAim.X, 0, horizAim.Z) - Vector3.new(lpHRP.Position.X, 0, lpHRP.Position.Z)
+    local dist = horizDist.Magnitude
+    local t = math.max(0.02, dist / math.max(1, GRAPPLE_SPEED))
+
+    local g = Workspace.Gravity or 196.2
+    local y0 = targetHRP.Position.Y
+    local y_future = y0 + vy * t - 0.5 * g * t * t
+
+    -- clamp so we never aim way above/below
+    local maxY = y0 + MAX_Y_ABOVE
+    local minY = y0 - MAX_Y_BELOW
+    local y_clamped = math.clamp(y_future, minY, maxY)
+    if y_clamped < y0 + MIN_RELATIVE_Y then
+        y_clamped = y0 + MIN_RELATIVE_Y
+    end
+
+    return y_clamped, t
+end
+
+-- combine: horizontal lead + vertical Y prediction (Y adjusted only)
+local function computeAimPosition(target)
+    local targetHRP = hrpOf(target)
+    if not targetHRP then return nil end
+    local lpHRP = hrpOf(LocalPlayer)
+    local horizAim = computeHorizontalAim(targetHRP, lpHRP)
+    local y_pred, t_est = predictVerticalY(targetHRP, horizAim)
+    -- final aim uses predicted/clamped Y only
+    return Vector3.new(horizAim.X, y_pred, horizAim.Z), t_est
+end
+
+-- single-shot fire
+local function shootOnce(target)
+    local tool = hasGrappleTool()
+    if not (tool and tool:FindFirstChild("RemoteEvent")) then
+        statusLabel.Text = "Status: ❌ Grapple missing"
+        return
+    end
+
+    local aimPos, predictedTime = computeAimPosition(target)
+    if not aimPos then
+        statusLabel.Text = "Status: ❌ HRP missing"
+        return
+    end
+
+    statusLabel.Text = "Status: Firing..."
+    pcall(function()
+        tool.RemoteEvent:FireServer(aimPos)
+    end)
+
+    -- small UI feedback
+    statusLabel.Text = string.format("Status: Shot (lead %.1f) ", (aimPos - target.Character.HumanoidRootPart.Position).Magnitude)
+end
+
+-- button action
+shootBtn.MouseButton1Click:Connect(function()
+    local q = nameBox.Text
+    if not q or q == "" then
+        statusLabel.Text = "Status: ⚠️ Enter name"
+        return
+    end
+    local t = acquireTarget(q)
+    if not t then
+        statusLabel.Text = "Status: ❌ Target not found"
+        return
+    end
+    statusLabel.Text = "Status: Target " .. t.Name
+    shootOnce(t)
+end)
